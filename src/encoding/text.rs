@@ -270,7 +270,8 @@ impl DescriptorEncoder<'_> {
             name,
             unit,
             const_labels: self.labels,
-            family_labels: None,
+            family_labels: [None; 16],
+            family_labels_size: 0,
         })
     }
 }
@@ -290,15 +291,18 @@ pub(crate) struct MetricEncoder<'a> {
     name: &'a str,
     unit: Option<&'a Unit>,
     const_labels: &'a [(Cow<'static, str>, Cow<'static, str>)],
-    family_labels: Option<&'a dyn super::EncodeLabelSet>,
+    family_labels: [Option<&'a dyn super::EncodeLabelSet>; 16],
+    family_labels_size: usize,
 }
 
 impl std::fmt::Debug for MetricEncoder<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut labels = String::new();
         let mut encoder = LabelSetEncoder::new(&mut labels).into();
-        if let Some(l) = self.family_labels {
-            l.encode(&mut encoder)?;
+        for idx in 0..self.family_labels_size {
+            if let Some(l) = self.family_labels[idx] {
+                l.encode(&mut encoder)?;
+            }
         }
 
         f.debug_struct("Encoder")
@@ -384,7 +388,10 @@ impl MetricEncoder<'_> {
         &'s mut self,
         label_set: &'s S,
     ) -> Result<MetricEncoder<'s>, std::fmt::Error> {
-        debug_assert!(self.family_labels.is_none());
+        debug_assert!(self.family_labels_size < self.family_labels.len());
+
+        let mut family_labels = self.family_labels.clone();
+        family_labels[self.family_labels_size] = Some(label_set);
 
         Ok(MetricEncoder {
             writer: self.writer,
@@ -392,7 +399,8 @@ impl MetricEncoder<'_> {
             name: self.name,
             unit: self.unit,
             const_labels: self.const_labels,
-            family_labels: Some(label_set),
+            family_labels: family_labels,
+            family_labels_size: self.family_labels_size + 1,
         })
     }
 
@@ -504,15 +512,19 @@ impl MetricEncoder<'_> {
     ) -> Result<(), std::fmt::Error> {
         if self.const_labels.is_empty()
             && additional_labels.is_none()
-            && self.family_labels.is_none()
+            && self.family_labels_size == 0
         {
             return Ok(());
         }
 
         self.writer.write_str("{")?;
 
+        // const_labels
+
         self.const_labels
             .encode(&mut LabelSetEncoder::new(self.writer).into())?;
+
+        // additional_labels
 
         if let Some(additional_labels) = additional_labels {
             if !self.const_labels.is_empty() {
@@ -522,37 +534,21 @@ impl MetricEncoder<'_> {
             additional_labels.encode(&mut LabelSetEncoder::new(self.writer).into())?;
         }
 
-        /// Writer impl which prepends a comma on the first call to write output to the wrapped writer
-        struct CommaPrependingWriter<'a> {
-            writer: &'a mut dyn Write,
-            should_prepend: bool,
-        }
+        // family_labels
 
-        impl Write for CommaPrependingWriter<'_> {
-            fn write_str(&mut self, s: &str) -> std::fmt::Result {
-                if self.should_prepend {
-                    self.writer.write_char(',')?;
-                    self.should_prepend = false;
-                }
-                self.writer.write_str(s)
-            }
-        }
-
-        if let Some(labels) = self.family_labels {
-            // if const labels or additional labels have been written, a comma must be prepended before writing the family labels.
-            // However, it could be the case that the family labels are `Some` and yet empty, so the comma should _only_
-            // be prepended if one of the `Write` methods are actually called when attempting to write the family labels.
-            // Therefore, wrap the writer on `Self` with a CommaPrependingWriter if other labels have been written and
-            // there may be a need to prepend an extra comma before writing additional labels.
+        if self.family_labels_size > 0 {
             if !self.const_labels.is_empty() || additional_labels.is_some() {
-                let mut writer = CommaPrependingWriter {
-                    writer: self.writer,
-                    should_prepend: true,
-                };
-                labels.encode(&mut LabelSetEncoder::new(&mut writer).into())?;
-            } else {
-                labels.encode(&mut LabelSetEncoder::new(self.writer).into())?;
-            };
+                self.writer.write_str(",")?;
+            }
+
+            for idx in 0..self.family_labels_size {
+                if idx > 0 {
+                    self.writer.write_str(",")?;
+                }
+                self.family_labels[idx]
+                    .expect("must be some")
+                    .encode(&mut LabelSetEncoder::new(&mut self.writer).into())?;
+            }
         }
 
         self.writer.write_str("}")?;
